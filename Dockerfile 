@@ -1,0 +1,14 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Installer les dépendances
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copier tout le code
+COPY . .
+
+# Railway fournit la variable d'environnement PORT automatiquement
+# On écoute sur ce port, fallback 8000 si PORT n'est pas défini (local)
+CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
