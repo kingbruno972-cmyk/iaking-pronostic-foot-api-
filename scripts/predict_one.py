@@ -1,171 +1,204 @@
+"""
+scripts/predict_one.py
+
+Petit script utilitaire pour faire une prédiction 1/N/2 pour un match
+à partir du modèle entraîné (models/model_1x2.pkl).
+
+Utilisation en ligne de commande :
+    python scripts/predict_one.py "PSG" "Marseille"
+
+Peut aussi être importé depuis l'API :
+    from scripts.predict_one import predict_one
+"""
+
 import sys
 from pathlib import Path
-import pandas as pd
+from typing import Dict, Any
+
 import joblib
-
-# Pour pouvoir importer features.elo même sans PYTHONPATH
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(ROOT))
-
-from features.elo import compute_elo_table  # type: ignore
-from betting.kelly import kelly_fraction    # tu l'as déjà
-
-HISTO = ROOT / "data" / "raw" / "matches.csv"
-MODEL_PATH = ROOT / "models" / "model_1x2.pkl"
-FEAT_PATH = ROOT / "models" / "feature_columns.pkl"
+import numpy as np
+import pandas as pd
 
 
-def last_n_stats(df, team, date, n=5):
-    past = df[
-        ((df["home"] == team) | (df["away"] == team))
-        & (df["date"] < date)
-    ].sort_values("date").tail(n)
+# Chemins vers le modèle et les colonnes de features
+ROOT_DIR = Path(__file__).resolve().parent.parent
+MODELS_DIR = ROOT_DIR / "models"
 
-    if past.empty:
-        return {"form_goals_for": 0.0, "form_goals_against": 0.0, "form_points": 0.0}
-
-    gf = ga = pts = 0
-    for _, r in past.iterrows():
-        if r["home"] == team:
-            gfor, gagn = r["home_goals"], r["away_goals"]
-        else:
-            gfor, gagn = r["away_goals"], r["home_goals"]
-
-        gf += float(gfor)
-        ga += float(gagn)
-        pts += 3 if gfor > gagn else (1 if gfor == gagn else 0)
-
-    return {
-        "form_goals_for": gf / n,
-        "form_goals_against": ga / n,
-        "form_points": float(pts),
-    }
+MODEL_PATH = MODELS_DIR / "model_1x2.pkl"
+FEATURE_COLS_PATH = MODELS_DIR / "feature_columns.pkl"
 
 
-def main():
-    if not HISTO.exists():
-        print("❌ Historique introuvable :", HISTO)
-        sys.exit(1)
+class ModelNotReadyError(Exception):
+    """Levée si le modèle ou les colonnes de features sont introuvables."""
+    pass
 
-    print("=== IA Pronostic Foot – Prono simple ===")
 
-    league = input("Ligue (ex: FRA1, ESP1…) : ").strip() or "FRA1"
-    home = input("Équipe à domicile : ").strip()
-    away = input("Équipe à l'extérieur : ").strip()
-    date_str = input("Date du match (YYYY-MM-DD) : ").strip()
+def load_model_and_features():
+    """
+    Charge le modèle 1X2 et la liste des colonnes de features.
 
-    if not home or not away or not date_str:
-        print("❌ Tu dois remplir home, away et date.")
-        sys.exit(1)
+    :return: (model, feature_columns)
+    :raises ModelNotReadyError: si les fichiers n'existent pas.
+    """
+    if not MODEL_PATH.exists():
+        raise ModelNotReadyError(
+            f"Modèle introuvable : {MODEL_PATH}. "
+            f"Tu dois d'abord lancer l'entraînement : python training/train_1x2.py"
+        )
 
-    try:
-        date = pd.to_datetime(date_str)
-    except Exception:
-        print("❌ Mauvais format de date, utilise YYYY-MM-DD.")
-        sys.exit(1)
+    if not FEATURE_COLS_PATH.exists():
+        raise ModelNotReadyError(
+            f"Fichier des colonnes de features introuvable : {FEATURE_COLS_PATH}. "
+            f"Vérifie le script d'entraînement."
+        )
 
-    # Charge modèle + features
     model = joblib.load(MODEL_PATH)
-    feature_cols = joblib.load(FEAT_PATH)
+    feature_columns = joblib.load(FEATURE_COLS_PATH)
 
-    # Charge historique + Elo
-    df = pd.read_csv(HISTO, parse_dates=["date"]).sort_values("date")
-    elo_tab = compute_elo_table(df)
+    if not isinstance(feature_columns, (list, tuple)):
+        raise ModelNotReadyError(
+            f"feature_columns.pkl ne contient pas une liste de colonnes (type: {type(feature_columns)})"
+        )
 
-    def last_elo(team):
-        s = elo_tab[
-            (elo_tab["league"] == league)
-            & (elo_tab["team"] == team)
-            & (elo_tab["date"] <= date)
-        ].sort_values("date").tail(1)["elo"]
-        return float(s.squeeze()) if not s.empty else 1500.0
+    return model, list(feature_columns)
 
-    elo_home = last_elo(home)
-    elo_away = last_elo(away)
 
-    home_stats = last_n_stats(df, home, date)
-    away_stats = last_n_stats(df, away, date)
+def build_feature_vector(feature_columns, home: str, away: str) -> pd.DataFrame:
+    """
+    Construit un vecteur de features pour un match (home, away).
 
-    features = {
-        "f_elo_diff": elo_home - elo_away,
-        "home_form_goals_for": home_stats["form_goals_for"],
-        "home_form_goals_against": home_stats["form_goals_against"],
-        "home_form_points": home_stats["form_points"],
-        "away_form_goals_for": away_stats["form_goals_for"],
-        "away_form_goals_against": away_stats["form_goals_against"],
-        "away_form_points": away_stats["form_points"],
+    ⚠️ VERSION SIMPLE : pour l'instant, on met toutes les features à 0.
+    Quand on branchera vraiment ton pipeline de features (Elo, etc.),
+    c'est ici qu'on utilisera features/build_features.py ou elo.py.
+
+    :param feature_columns: liste des colonnes attendues par le modèle
+    :param home: nom de l'équipe à domicile
+    :param away: nom de l'équipe à l'extérieur
+    :return: DataFrame avec une seule ligne de features
+    """
+    row = {col: 0.0 for col in feature_columns}
+
+    # Exemple : si ta feature s'appelle "f_elo_diff", tu pourrais plus tard
+    # calculer un vrai écart d'Elo ici.
+    # if "f_elo_diff" in row:
+    #     row["f_elo_diff"] = compute_elo_diff(home, away)
+
+    X = pd.DataFrame([row])
+    return X
+
+
+def decode_probas(classes, probas) -> Dict[str, float]:
+    """
+    Mappe les classes du modèle vers des clés 'home_win', 'draw', 'away_win'.
+
+    Le modèle peut avoir des classes: ['1', 'N', '2'] ou [0, 1, 2], etc.
+    On essaie de deviner intelligemment.
+    """
+    proba_dict = {"home_win": 0.0, "draw": 0.0, "away_win": 0.0}
+
+    mapping = {
+        "1": "home_win",
+        "H": "home_win",
+        1: "home_win",
+
+        "N": "draw",
+        "D": "draw",
+        "X": "draw",
+        0: "draw",
+
+        "2": "away_win",
+        "A": "away_win",
+        2: "away_win",
     }
 
-    X = pd.DataFrame([{col: features.get(col, 0) for col in feature_cols}])
-    proba = model.predict_proba(X)[0]
+    for cls, p in zip(classes, probas):
+        key = mapping.get(cls)
+        if key is None:
+            # Si on ne reconnaît pas la classe, on l'ignore
+            continue
+        proba_dict[key] = float(p)
+
+    # Normalisation légère si quelque chose ne tombe pas pile à 1
+    total = sum(proba_dict.values())
+    if total > 0:
+        for k in proba_dict:
+            proba_dict[k] = proba_dict[k] / total
+
+    return proba_dict
+
+
+def choose_label(proba_dict: Dict[str, float]) -> str:
+    """
+    Choisit le label final '1', 'N' ou '2' à partir des probas.
+    """
+    best = max(proba_dict, key=proba_dict.get)
+    if best == "home_win":
+        return "1"
+    elif best == "away_win":
+        return "2"
+    else:
+        return "N"
+
+
+def predict_one(home: str, away: str) -> Dict[str, Any]:
+    """
+    Prédit l'issue d'un match (home vs away) avec le modèle 1X2.
+
+    :param home: équipe à domicile
+    :param away: équipe à l'extérieur
+    :return: dict JSON-friendly
+    """
+    try:
+        model, feature_columns = load_model_and_features()
+    except ModelNotReadyError as e:
+        return {
+            "status": "error",
+            "home": home,
+            "away": away,
+            "message": str(e),
+        }
+
+    X = build_feature_vector(feature_columns, home, away)
+
+    # Probabilités de chaque classe
+    probas = model.predict_proba(X)[0]
     classes = list(model.classes_)
 
-    out = {"home": 0.0, "draw": 0.0, "away": 0.0}
-    for i, cls in enumerate(classes):
-        out[cls] = float(proba[i])
+    proba_dict = decode_probas(classes, probas)
+    label = choose_label(proba_dict)
 
-    p_home = out["home"]
-    p_draw = out["draw"]
-    p_away = out["away"]
+    return {
+        "status": "ok",
+        "home": home,
+        "away": away,
+        "prediction": label,          # '1', 'N' ou '2'
+        "probas": proba_dict,         # {home_win, draw, away_win}
+        "comment": (
+            "Prédiction basée sur le modèle 1X2 entraîné. "
+            "Les features sont actuellement simplifiées (tout à zéro)."
+        ),
+    }
 
-    def pct(x): return f"{x*100:.1f}%"
 
-    print("\n=== Résultat IA ===")
-    print(f"{home} vs {away} ({league}, {date_str})")
-    print(f"  Home : {pct(p_home)}")
-    print(f"  Draw : {pct(p_draw)}")
-    print(f"  Away : {pct(p_away)}")
+def main_cli(argv=None):
+    """
+    Entrée ligne de commande.
 
-    # Issue recommandée (max proba)
-    best_side = max(["home", "draw", "away"], key=lambda k: out[k])
-    best_label = {"home": "Victoire domicile", "draw": "Match nul", "away": "Victoire extérieur"}[best_side]
-    print(f"\n👉 Issue la plus probable : {best_label}")
+    Exemple:
+        python scripts/predict_one.py PSG Marseille
+    """
+    if argv is None:
+        argv = sys.argv[1:]
 
-    # Optionnel : cotes + value + mise
-    want_odds = input("\nAs-tu les cotes ? (o/n) : ").strip().lower()
-    if want_odds == "o":
-        try:
-            home_odds = float(input("Cote domicile : ").replace(",", "."))
-            draw_odds = float(input("Cote nul      : ").replace(",", "."))
-            away_odds = float(input("Cote extérieur: ").replace(",", "."))
-        except Exception:
-            print("⚠️ Cotes invalides, on s'arrête là.")
-            return
+    if len(argv) != 2:
+        print("Usage: python scripts/predict_one.py <HOME_TEAM> <AWAY_TEAM>")
+        sys.exit(1)
 
-        value_home = p_home * home_odds
-        value_draw = p_draw * draw_odds
-        value_away = p_away * away_odds
-
-        print("\n=== Value (p * cote) ===")
-        print(f"  Home : {value_home:.3f}")
-        print(f"  Draw : {value_draw:.3f}")
-        print(f"  Away : {value_away:.3f}")
-
-        # Meilleure value
-        values = {"home": value_home, "draw": value_draw, "away": value_away}
-        best_v_side = max(values, key=values.get)
-        print(f"\n🎯 Meilleur value bet : {best_v_side} (value = {values[best_v_side]:.3f})")
-
-        # Kelly (prudence x0.25)
-        bankroll_str = input("\nBankroll (€) pour la mise (ou vide pour sauter) : ").strip()
-        if bankroll_str:
-            try:
-                bankroll = float(bankroll_str.replace(",", "."))
-            except Exception:
-                print("⚠️ Bankroll invalide, pas de calcul de mise.")
-                return
-
-            stake_home = kelly_fraction(p_home, home_odds, b_mult=0.25)
-            stake_draw = kelly_fraction(p_draw, draw_odds, b_mult=0.25)
-            stake_away = kelly_fraction(p_away, away_odds, b_mult=0.25)
-
-            print("\n=== Mise conseillée (Kelly x0.25) ===")
-            print(f"  Home : {stake_home*100:.2f}%  (~ {stake_home*bankroll:.2f} €)")
-            print(f"  Draw : {stake_draw*100:.2f}%  (~ {stake_draw*bankroll:.2f} €)")
-            print(f"  Away : {stake_away*100:.2f}%  (~ {stake_away*bankroll:.2f} €)")
-
-    print("\n✅ Prono terminé.")
+    home, away = argv
+    result = predict_one(home, away)
+    # Affichage simple
+    print(result)
 
 
 if __name__ == "__main__":
-    main()
+    main_cli() 

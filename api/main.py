@@ -1,6 +1,8 @@
 from fastapi import FastAPI
+from scripts.predict_one import predict_one_match  # <- on importe ta fonction
 
 app = FastAPI()
+
 
 @app.get("/")
 def home():
@@ -9,18 +11,16 @@ def home():
         "message": "API pronostic foot en ligne ✅"
     }
 
-# Endpoint de test pour une prédiction simple
+
 @app.get("/predict_one")
-def predict_one(home: str, away: str):
+def predict_one_endpoint(home: str, away: str):
     """
-    TEMPORAIRE :
-    pour l’instant on renvoie juste les équipes.
-    On branchera ton vrai modèle ensuite.
+    Endpoint HTTP qui appelle ton vrai modèle.
     """
-    return {
-        "status": "ok",
-        "home": home,
-        "away": away,
-        "prediction": "TODO_brancher_modele",
-        "comment": "Route /predict_one OK, modèle à connecter."
-    } 
+    result = predict_one_match(home, away)
+
+    # Optionnel : on s'assure qu'il y ait toujours un status dans la réponse
+    if "status" not in result:
+        result["status"] = "ok"
+
+    return result
