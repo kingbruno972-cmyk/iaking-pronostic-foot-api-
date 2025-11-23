@@ -2,13 +2,36 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
-from scripts.apisports_client import (
-    get_predictions_for_fixture,
-    ApiSportsError,
+import requests
+
+# ============================
+#  CONFIG API-FOOTBALL (RAPIDAPI) – OPTION A (H2H)
+# ============================
+
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
+RAPIDAPI_HOST = "api-football-v1.p.rapidapi.com"
+BASE_URL = "https://api-football-v1.p.rapidapi.com/v3"
+
+# Ligue 1 France
+DEFAULT_LEAGUE_ID = 61     # ID Ligue 1 dans API-FOOTBALL
+DEFAULT_SEASON = 2024      # à adapter chaque saison
+TIMEOUT = 10
+
+session = requests.Session()
+session.headers.update(
+    {
+        "x-rapidapi-key": RAPIDAPI_KEY or "",
+        "x-rapidapi-host": RAPIDAPI_HOST,
+    }
 )
+
+
+class APIFootballError(Exception):
+    """Erreur custom pour API-FOOTBALL."""
 
 
 @dataclass
@@ -31,144 +54,251 @@ class PredictResult:
         }
 
 
-# =====================================================
-#  MODE A : PRONO À PARTIR DES COTES 1X2
-# =====================================================
+# ============================
+#  APPELS API-FOOTBALL (H2H) – OPTION A
+# ============================
 
-def _probs_from_odds(oh: float, od: float, oa: float) -> Dict[str, float]:
+def _api_get(path: str, params: Dict) -> Dict:
+    """Wrapper GET simple avec gestion d'erreurs."""
+    if not RAPIDAPI_KEY:
+        raise APIFootballError(
+            "RAPIDAPI_KEY n'est pas définie (variable d'environnement)."
+        )
+
+    url = f"{BASE_URL}/{path.lstrip('/')}"
+    resp = session.get(url, params=params, timeout=TIMEOUT)
+
+    if resp.status_code != 200:
+        raise APIFootballError(
+            f"HTTP {resp.status_code} sur {url} : {resp.text[:200]}"
+        )
+
+    data = resp.json()
+    if data.get("errors"):
+        raise APIFootballError(str(data["errors"]))
+
+    return data
+
+
+def get_team_id(
+    name: str,
+    league_id: int = DEFAULT_LEAGUE_ID,
+    season: int = DEFAULT_SEASON,
+) -> Optional[int]:
     """
-    Transforme des cotes 1X2 en probabilités normalisées.
-    p = (1/odds) / somme(1/odds)
+    Retourne l'ID API-FOOTBALL pour une équipe (par son nom).
+    On filtre par Ligue 1 + saison pour éviter les doublons.
     """
-    if oh <= 0 or od <= 0 or oa <= 0:
-        raise ValueError("Toutes les cotes doivent être > 0")
+    data = _api_get(
+        "teams",
+        {
+            "name": name,
+            "league": league_id,
+            "season": season,
+        },
+    )
 
-    inv_home = 1.0 / oh
-    inv_draw = 1.0 / od
-    inv_away = 1.0 / oa
+    resp_list = data.get("response") or []
+    if not resp_list:
+        return None
 
-    total = inv_home + inv_draw + inv_away
-
-    p_home = inv_home / total
-    p_draw = inv_draw / total
-    p_away = inv_away / total
-
-    return {
-        "p_home": p_home,
-        "p_draw": p_draw,
-        "p_away": p_away,
-    }
+    return resp_list[0]["team"]["id"]
 
 
-def predict_one_match(
-    home: str,
-    away: str,
-    odds_home: Optional[float] = None,
-    odds_draw: Optional[float] = None,
-    odds_away: Optional[float] = None,
-) -> Dict:
+def get_head_to_head_stats(
+    home_id: int, away_id: int, last: int = 20
+) -> Tuple[int, int, int, int]:
     """
-    Endpoint principal /predict_one
-
-    2 modes :
-    - Si les 3 cotes 1X2 sont fournies => calcule les probas à partir des cotes
-    - Sinon => renvoie des probas 33/33/33 (démo)
+    Récupère les derniers face-à-face entre home_id et away_id.
+    Retourne : (home_wins, draws, away_wins, nb_matchs)
     """
+    data = _api_get(
+        "fixtures/headtohead",
+        {
+            "h2h": f"{home_id}-{away_id}",
+            "last": last,
+        },
+    )
 
+    fixtures = data.get("response") or []
+
+    home_wins = 0
+    away_wins = 0
+    draws = 0
+
+    for f in fixtures:
+        teams = f.get("teams", {})
+        home_team = teams.get("home", {})
+        away_team = teams.get("away", {})
+
+        home_team_id = home_team.get("id")
+        away_team_id = away_team.get("id")
+
+        winner_is_home = home_team.get("winner")
+        winner_is_away = away_team.get("winner")
+
+        # Match nul
+        if winner_is_home is None and winner_is_away is None:
+            draws += 1
+            continue
+
+        # Victoire "home" (côté API-FOOTBALL)
+        if winner_is_home:
+            if home_team_id == home_id:
+                home_wins += 1
+            elif home_team_id == away_id:
+                away_wins += 1
+            continue
+
+        # Victoire "away"
+        if winner_is_away:
+            if away_team_id == home_id:
+                home_wins += 1
+            elif away_team_id == away_id:
+                away_wins += 1
+            continue
+
+    total = home_wins + draws + away_wins
+    return home_wins, draws, away_wins, total
+
+
+def predict_one_match(home: str, away: str) -> Dict:
+    """
+    OPTION A : Prono 1N2 basé sur les head-to-head API-FOOTBALL.
+    """
     home_clean = home.strip()
     away_clean = away.strip()
 
     if not home_clean or not away_clean:
+        return PredictResult(
+            prediction="",
+            p_home=0.0,
+            p_draw=0.0,
+            p_away=0.0,
+            comment="Nom d'équipe manquant.",
+            status="error",
+        ).to_dict()
+
+    try:
+        # 1) IDs des équipes
+        home_id = get_team_id(home_clean)
+        away_id = get_team_id(away_clean)
+
+        if home_id is None or away_id is None:
+            return PredictResult(
+                prediction="",
+                p_home=0.0,
+                p_draw=0.0,
+                p_away=0.0,
+                comment=(
+                    f"Impossible de trouver les équipes '{home_clean}' "
+                    f"et/ou '{away_clean}' dans API-FOOTBALL (Ligue 1 {DEFAULT_SEASON})."
+                ),
+                status="error",
+            ).to_dict()
+
+        # 2) Head-to-head
+        home_wins, draws, away_wins, total = get_head_to_head_stats(
+            home_id, away_id, last=20
+        )
+
+        if total == 0:
+            p_home = p_draw = p_away = 1.0 / 3.0
+            prediction = "Données insuffisantes, probas équilibrées."
+            comment = (
+                "Aucun face-à-face récent trouvé entre ces deux équipes. "
+                "Probabilités 1N2 mises à 33.3% / 33.3% / 33.3%."
+            )
+        else:
+            # Lissage
+            home_adj = home_wins + 1
+            draw_adj = draws + 1
+            away_adj = away_wins + 1
+            denom = home_adj + draw_adj + away_adj
+
+            p_home = home_adj / denom
+            p_draw = draw_adj / denom
+            p_away = away_adj / denom
+
+            if p_home >= p_draw and p_home >= p_away:
+                prediction = f"Victoire de {home_clean}"
+            elif p_away >= p_home and p_away >= p_draw:
+                prediction = f"Victoire de {away_clean}"
+            else:
+                prediction = "Match nul"
+
+            comment = (
+                f"Probas issues des {total} derniers face-à-face (Ligue 1) : "
+                f"home_wins={home_wins}, draws={draws}, away_wins={away_wins}. "
+                f"Après lissage : p_home={p_home:.3f}, p_draw={p_draw:.3f}, "
+                f"p_away={p_away:.3f}. Issue la plus probable : {prediction}."
+            )
+
+        res = PredictResult(
+            prediction=prediction,
+            p_home=p_home,
+            p_draw=p_draw,
+            p_away=p_away,
+            comment=comment,
+            status="ok",
+        )
+        return res.to_dict()
+
+    except APIFootballError as e:
         res = PredictResult(
             prediction="",
             p_home=0.0,
             p_draw=0.0,
             p_away=0.0,
-            comment="Nom d'équipe manquant (home / away).",
+            comment=f"Erreur API-FOOTBALL (H2H) : {e}",
             status="error",
         )
         return res.to_dict()
 
-    comment_parts = []
-
-    # ====== CAS 1 : cotes fournies ======
-    if odds_home is not None and odds_draw is not None and odds_away is not None:
-        try:
-            probs = _probs_from_odds(odds_home, odds_draw, odds_away)
-            p_home = probs["p_home"]
-            p_draw = probs["p_draw"]
-            p_away = probs["p_away"]
-
-            comment_parts.append(
-                f"Probabilités calculées à partir des cotes 1X2 "
-                f"(home={odds_home}, draw={odds_draw}, away={odds_away}). "
-                f"p_home={p_home:.3f}, p_draw={p_draw:.3f}, p_away={p_away:.3f}."
-            )
-        except Exception as e:
-            # Si problème avec les cotes, on tombe en mode démo
-            p_home = p_draw = p_away = 1.0 / 3.0
-            comment_parts.append(
-                f"Erreur dans les cotes fournies ({e}), "
-                "probas mises à 33.3% / 33.3% / 33.3% (démo)."
-            )
-
-    # ====== CAS 2 : pas de cotes => mode démo ======
-    else:
-        p_home = p_draw = p_away = 1.0 / 3.0
-        comment_parts.append(
-            "Aucune cote fournie, mode démo : probas 33.3% / 33.3% / 33.3%."
+    except Exception as e:
+        res = PredictResult(
+            prediction="",
+            p_home=0.0,
+            p_draw=0.0,
+            p_away=0.0,
+            comment=f"Erreur interne backend : {e}",
+            status="error",
         )
-
-    # Issue la plus probable
-    if p_home >= p_draw and p_home >= p_away:
-        prediction = f"Victoire de {home_clean}"
-    elif p_away >= p_home and p_away >= p_draw:
-        prediction = f"Victoire de {away_clean}"
-    else:
-        prediction = "Match nul"
-
-    comment_parts.append(f"Issue la plus probable : {prediction}")
-
-    comment = " ".join(comment_parts)
-
-    res = PredictResult(
-        prediction=prediction,
-        p_home=p_home,
-        p_draw=p_draw,
-        p_away=p_away,
-        comment=comment,
-        status="ok",
-    )
-    return res.to_dict()
+        return res.to_dict()
 
 
-# =====================================================
-#  MODE B : PRONO VIA API-FOOTBALL /predictions
-# =====================================================
+# ============================
+#  OPTION B : PRONOS OFFICIELS API-SPORTS (/predictions)
+# ============================
+
+from scripts.apisports_client import (
+    get_predictions_for_fixture,
+    ApiSportsError,
+)
+
 
 def predict_one_match_from_apisports(fixture_id: int) -> Dict:
     """
-    Option B : va chercher les pourcentages 1N2 depuis API-FOOTBALL
+    OPTION B : va chercher les pourcentages 1N2 depuis API-FOOTBALL
     pour un fixture précis (endpoint /predictions).
     """
     try:
         pred = get_predictions_for_fixture(fixture_id)
     except ApiSportsError as e:
-        # En cas de problème API, on renvoie une erreur propre
-        return {
-            "prediction": "Erreur API-FOOTBALL",
-            "p_home": 0.0,
-            "p_draw": 0.0,
-            "p_away": 0.0,
-            "comment": f"❌ {e}",
-            "status": "error",
-        }
+        return PredictResult(
+            prediction="Erreur API-FOOTBALL (Option B)",
+            p_home=0.0,
+            p_draw=0.0,
+            p_away=0.0,
+            comment=f"❌ {e}",
+            status="error",
+        ).to_dict()
 
     p_home = pred["p_home"]
     p_draw = pred["p_draw"]
     p_away = pred["p_away"]
 
-    # On choisit l’issue la plus probable
+    # Issue la plus probable
     if p_home >= p_draw and p_home >= p_away:
         prediction = "Victoire domicile"
     elif p_away >= p_home and p_away >= p_draw:
@@ -176,7 +306,7 @@ def predict_one_match_from_apisports(fixture_id: int) -> Dict:
     else:
         prediction = "Match nul"
 
-    advice = pred.get("advice") or ""
+    advice = pred.get("advice") or "N/A"
     winner_name = pred.get("winner_name") or ""
     winner_comment = pred.get("winner_comment") or ""
 
@@ -184,8 +314,8 @@ def predict_one_match_from_apisports(fixture_id: int) -> Dict:
         f"Prono API-FOOTBALL (Option B). "
         f"p_home={p_home:.3f}, p_draw={p_draw:.3f}, p_away={p_away:.3f}. "
         f"Issue la plus probable : {prediction}. "
-        f"Advice API : {advice or 'N/A'}. "
-        f"Winner API : {winner_name} ({winner_comment})."
+        f"Advice API : {advice}. "
+        f"Winner : {winner_name} ({winner_comment})."
     )
 
     res = PredictResult(
