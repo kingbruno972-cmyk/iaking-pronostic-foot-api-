@@ -1,17 +1,20 @@
-# ---- Base Python image ----
+# ---- 1. Image de base ----
 FROM python:3.10-slim
 
-# ---- Set working directory ----
+# ---- 2. Dossier de l'app ----
 WORKDIR /app
 
-# ---- Copy project files ----
-COPY . /app
+# ---- 3. Copier requirements ----
+COPY requirements.txt .
 
-# ---- Install dependencies ----
+# ---- 4. Installer dépendances ----
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ---- Expose the port ----
+# ---- 5. Copier ton code ----
+COPY . .
+
+# ---- 6. Exposer le port ----
 EXPOSE 8000
 
-# ---- Start API with Uvicorn ----
+# ---- 7. Commande de démarrage ----
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
