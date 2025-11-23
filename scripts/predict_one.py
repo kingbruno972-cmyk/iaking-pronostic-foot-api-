@@ -142,7 +142,7 @@ def get_head_to_head_stats(
             draws += 1
             continue
 
-        # Victoire "home" (côté API-FOOTBALL)
+        # Victoire "home"
         if winner_is_home:
             if home_team_id == home_id:
                 home_wins += 1
@@ -279,26 +279,35 @@ from scripts.apisports_client import (
 
 def predict_one_match_from_apisports(fixture_id: int) -> Dict:
     """
-    OPTION B : va chercher les pourcentages 1N2 depuis API-FOOTBALL
-    pour un fixture précis (endpoint /predictions).
+    Option B : va chercher les pourcentages 1N2 + BTTS + Over/Under
+    depuis API-FOOTBALL pour un fixture précis.
     """
     try:
         pred = get_predictions_for_fixture(fixture_id)
     except ApiSportsError as e:
-        return PredictResult(
-            prediction="Erreur API-FOOTBALL (Option B)",
-            p_home=0.0,
-            p_draw=0.0,
-            p_away=0.0,
-            comment=f"❌ {e}",
-            status="error",
-        ).to_dict()
+        # En cas de problème API, on renvoie une erreur propre
+        return {
+            "prediction": "Erreur API-FOOTBALL",
+            "p_home": 0.0,
+            "p_draw": 0.0,
+            "p_away": 0.0,
+            "comment": f"❌ {e}",
+            "status": "error",
+        }
 
-    p_home = pred["p_home"]
-    p_draw = pred["p_draw"]
-    p_away = pred["p_away"]
+    p_home = float(pred.get("p_home", 0.0))
+    p_draw = float(pred.get("p_draw", 0.0))
+    p_away = float(pred.get("p_away", 0.0))
 
-    # Issue la plus probable
+    advice = pred.get("advice") or ""
+    winner_name = pred.get("winner_name") or ""
+    winner_comment = pred.get("winner_comment") or ""
+    btts = pred.get("btts") or ""
+    under_over = pred.get("under_over") or ""
+    goals_home = pred.get("goals_home")
+    goals_away = pred.get("goals_away")
+
+    # On choisit l’issue la plus probable
     if p_home >= p_draw and p_home >= p_away:
         prediction = "Victoire domicile"
     elif p_away >= p_home and p_away >= p_draw:
@@ -306,17 +315,34 @@ def predict_one_match_from_apisports(fixture_id: int) -> Dict:
     else:
         prediction = "Match nul"
 
-    advice = pred.get("advice") or "N/A"
-    winner_name = pred.get("winner_name") or ""
-    winner_comment = pred.get("winner_comment") or ""
+    # Construction du commentaire PRO
+    parts = []
 
-    comment = (
+    parts.append(
         f"Prono API-FOOTBALL (Option B). "
         f"p_home={p_home:.3f}, p_draw={p_draw:.3f}, p_away={p_away:.3f}. "
-        f"Issue la plus probable : {prediction}. "
-        f"Advice API : {advice}. "
-        f"Winner : {winner_name} ({winner_comment})."
+        f"Issue la plus probable : {prediction}."
     )
+
+    if btts:
+        parts.append(f"BTTS : {btts}.")          # ex. 'Yes' / 'No' / etc.
+    if under_over:
+        parts.append(f"Over/Under principal : {under_over}.")
+
+    if goals_home is not None or goals_away is not None:
+        parts.append(
+            f"Buts estimés (modèle API) : home={goals_home}, away={goals_away}."
+        )
+
+    if winner_name or winner_comment:
+        parts.append(
+            f"Winner API : {winner_name or 'N/A'} ({winner_comment or ''})."
+        )
+
+    if advice:
+        parts.append(f"Conseil API : {advice}.")
+
+    comment = " ".join(parts)
 
     res = PredictResult(
         prediction=prediction,
@@ -324,6 +350,5 @@ def predict_one_match_from_apisports(fixture_id: int) -> Dict:
         p_draw=p_draw,
         p_away=p_away,
         comment=comment,
-        status="ok",
     )
     return res.to_dict()

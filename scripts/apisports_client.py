@@ -20,7 +20,7 @@ def get_api_key() -> str:
     if not key:
         raise ApiSportsError(
             "Variable d'environnement APISPORTS_KEY non définie. "
-            "Dans le terminal : export APISPORTS_KEY=\"TA_CLE_ICI\""
+            'Dans le terminal : export APISPORTS_KEY="TA_CLE_ICI"'
         )
     return key
 
@@ -73,6 +73,13 @@ def get_predictions_for_fixture(fixture_id: int) -> Dict[str, Any]:
     """
     Appelle /predictions pour un fixture donné.
     On suppose que le endpoint est disponible dans ton plan.
+    On retourne :
+      - proba 1N2 (p_home/p_draw/p_away)
+      - conseil (advice)
+      - vainqueur (winner_name + winner_comment)
+      - BTTS (btts)
+      - Over/Under principal (under_over)
+      - buts attendus (goals_home/goals_away) si dispo
     """
     url = f"{BASE_URL}/predictions"
     params = {"fixture": fixture_id}
@@ -96,8 +103,9 @@ def get_predictions_for_fixture(fixture_id: int) -> Dict[str, Any]:
     # Structure typique API-FOOTBALL
     item = resp_list[0]
     predictions = item.get("predictions") or item.get("prediction") or {}
-    percent = predictions.get("percent", {})
+    percent = predictions.get("percent", {}) or {}
 
+    # 1) Probabilités 1N2 (en % -> proba)
     home_pct = percent.get("home")
     draw_pct = percent.get("draw")
     away_pct = percent.get("away")
@@ -115,6 +123,14 @@ def get_predictions_for_fixture(fixture_id: int) -> Dict[str, Any]:
     p_draw = _to_prob(draw_pct)
     p_away = _to_prob(away_pct)
 
+    # 2) BTTS / Over-Under / Goals
+    btts = predictions.get("btts") or ""
+    under_over = predictions.get("under_over") or ""
+    goals_block = predictions.get("goals") or {}
+    goals_home = goals_block.get("home")
+    goals_away = goals_block.get("away")
+
+    # 3) Winner + Advice
     advice = predictions.get("advice") or ""
     winner = predictions.get("winner") or {}
     winner_name = winner.get("name") or ""
@@ -127,5 +143,9 @@ def get_predictions_for_fixture(fixture_id: int) -> Dict[str, Any]:
         "advice": advice,
         "winner_name": winner_name,
         "winner_comment": winner_comment,
+        "btts": btts,
+        "under_over": under_over,
+        "goals_home": goals_home,
+        "goals_away": goals_away,
         "raw": data,  # pour debug si besoin
     }
