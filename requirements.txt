@@ -7,3 +7,4 @@ scikit-learn
 joblib
 pyjanitor
 python-multipart
+requests==2.31.0

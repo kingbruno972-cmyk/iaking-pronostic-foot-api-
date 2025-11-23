@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
+
+from scripts.apisports_client import (
+    get_predictions_for_fixture,
+    ApiSportsError,
+)
 
 
 @dataclass
 class PredictResult:
-    """
-    Structure de sortie standard pour /predict_one.
-    """
     prediction: str
     p_home: float
     p_draw: float
@@ -29,30 +31,33 @@ class PredictResult:
         }
 
 
-def _probs_from_odds(
-    odds_home: float,
-    odds_draw: float,
-    odds_away: float,
-) -> Tuple[float, float, float]:
-    """
-    Convertit des cotes 1X2 en probabilités en corrigeant la marge du bookmaker.
+# =====================================================
+#  MODE A : PRONO À PARTIR DES COTES 1X2
+# =====================================================
 
-    Exemple :
-        1.15 / 7.20 / 14.0  → p_home ≈ 0.80, p_draw ≈ 0.13, p_away ≈ 0.07
+def _probs_from_odds(oh: float, od: float, oa: float) -> Dict[str, float]:
     """
-    inv_home = 1.0 / odds_home
-    inv_draw = 1.0 / odds_draw
-    inv_away = 1.0 / odds_away
+    Transforme des cotes 1X2 en probabilités normalisées.
+    p = (1/odds) / somme(1/odds)
+    """
+    if oh <= 0 or od <= 0 or oa <= 0:
+        raise ValueError("Toutes les cotes doivent être > 0")
+
+    inv_home = 1.0 / oh
+    inv_draw = 1.0 / od
+    inv_away = 1.0 / oa
 
     total = inv_home + inv_draw + inv_away
-    if total <= 0:
-        # Cas ultra improbable, mais on protège:
-        return 1.0 / 3, 1.0 / 3, 1.0 / 3
 
     p_home = inv_home / total
     p_draw = inv_draw / total
     p_away = inv_away / total
-    return p_home, p_draw, p_away
+
+    return {
+        "p_home": p_home,
+        "p_draw": p_draw,
+        "p_away": p_away,
+    }
 
 
 def predict_one_match(
@@ -63,61 +68,124 @@ def predict_one_match(
     odds_away: Optional[float] = None,
 ) -> Dict:
     """
-    Prono 1X2 pour un match unique.
+    Endpoint principal /predict_one
 
-    - Si les cotes 1X2 (odds_home / odds_draw / odds_away) sont fournies ET > 1.0,
-      on calcule des probabilités réalistes à partir des cotes.
-    - Sinon, on utilise un fallback (démo) pour que tout fonctionne quand même.
-
-    Cette fonction est appelée par l’endpoint FastAPI /predict_one.
+    2 modes :
+    - Si les 3 cotes 1X2 sont fournies => calcule les probas à partir des cotes
+    - Sinon => renvoie des probas 33/33/33 (démo)
     """
 
-    # ==============================
-    # 1) Si les cotes sont fournies
-    # ==============================
-    use_odds = (
-        odds_home is not None
-        and odds_draw is not None
-        and odds_away is not None
-        and odds_home > 1.0
-        and odds_draw > 1.0
-        and odds_away > 1.0
-    )
+    home_clean = home.strip()
+    away_clean = away.strip()
 
-    if use_odds:
-        p_home, p_draw, p_away = _probs_from_odds(
-            odds_home=odds_home,
-            odds_draw=odds_draw,
-            odds_away=odds_away,
+    if not home_clean or not away_clean:
+        res = PredictResult(
+            prediction="",
+            p_home=0.0,
+            p_draw=0.0,
+            p_away=0.0,
+            comment="Nom d'équipe manquant (home / away).",
+            status="error",
         )
-        source = (
-            "Probabilités calculées à partir des cotes 1X2 "
-            f"(home={odds_home}, draw={odds_draw}, away={odds_away})."
-        )
+        return res.to_dict()
+
+    comment_parts = []
+
+    # ====== CAS 1 : cotes fournies ======
+    if odds_home is not None and odds_draw is not None and odds_away is not None:
+        try:
+            probs = _probs_from_odds(odds_home, odds_draw, odds_away)
+            p_home = probs["p_home"]
+            p_draw = probs["p_draw"]
+            p_away = probs["p_away"]
+
+            comment_parts.append(
+                f"Probabilités calculées à partir des cotes 1X2 "
+                f"(home={odds_home}, draw={odds_draw}, away={odds_away}). "
+                f"p_home={p_home:.3f}, p_draw={p_draw:.3f}, p_away={p_away:.3f}."
+            )
+        except Exception as e:
+            # Si problème avec les cotes, on tombe en mode démo
+            p_home = p_draw = p_away = 1.0 / 3.0
+            comment_parts.append(
+                f"Erreur dans les cotes fournies ({e}), "
+                "probas mises à 33.3% / 33.3% / 33.3% (démo)."
+            )
+
+    # ====== CAS 2 : pas de cotes => mode démo ======
     else:
-        # =========================================
-        # 2) Fallback si pas de cotes (mode démo)
-        # =========================================
-        p_home, p_draw, p_away = 0.30, 0.20, 0.50
-        source = (
-            "Probabilités de démo (aucune cote valide fournie). "
-            "À remplacer par de vraies cotes ou un modèle IA."
+        p_home = p_draw = p_away = 1.0 / 3.0
+        comment_parts.append(
+            "Aucune cote fournie, mode démo : probas 33.3% / 33.3% / 33.3%."
         )
 
-    # ==========================
-    # 3) Issue la plus probable
-    # ==========================
+    # Issue la plus probable
     if p_home >= p_draw and p_home >= p_away:
-        prediction = f"Victoire de {home}"
+        prediction = f"Victoire de {home_clean}"
     elif p_away >= p_home and p_away >= p_draw:
-        prediction = f"Victoire de {away}"
+        prediction = f"Victoire de {away_clean}"
     else:
         prediction = "Match nul"
 
+    comment_parts.append(f"Issue la plus probable : {prediction}")
+
+    comment = " ".join(comment_parts)
+
+    res = PredictResult(
+        prediction=prediction,
+        p_home=p_home,
+        p_draw=p_draw,
+        p_away=p_away,
+        comment=comment,
+        status="ok",
+    )
+    return res.to_dict()
+
+
+# =====================================================
+#  MODE B : PRONO VIA API-FOOTBALL /predictions
+# =====================================================
+
+def predict_one_match_from_apisports(fixture_id: int) -> Dict:
+    """
+    Option B : va chercher les pourcentages 1N2 depuis API-FOOTBALL
+    pour un fixture précis (endpoint /predictions).
+    """
+    try:
+        pred = get_predictions_for_fixture(fixture_id)
+    except ApiSportsError as e:
+        # En cas de problème API, on renvoie une erreur propre
+        return {
+            "prediction": "Erreur API-FOOTBALL",
+            "p_home": 0.0,
+            "p_draw": 0.0,
+            "p_away": 0.0,
+            "comment": f"❌ {e}",
+            "status": "error",
+        }
+
+    p_home = pred["p_home"]
+    p_draw = pred["p_draw"]
+    p_away = pred["p_away"]
+
+    # On choisit l’issue la plus probable
+    if p_home >= p_draw and p_home >= p_away:
+        prediction = "Victoire domicile"
+    elif p_away >= p_home and p_away >= p_draw:
+        prediction = "Victoire extérieur"
+    else:
+        prediction = "Match nul"
+
+    advice = pred.get("advice") or ""
+    winner_name = pred.get("winner_name") or ""
+    winner_comment = pred.get("winner_comment") or ""
+
     comment = (
-        f"{source} "
+        f"Prono API-FOOTBALL (Option B). "
         f"p_home={p_home:.3f}, p_draw={p_draw:.3f}, p_away={p_away:.3f}. "
-        f"Issue la plus probable : {prediction}"
+        f"Issue la plus probable : {prediction}. "
+        f"Advice API : {advice or 'N/A'}. "
+        f"Winner API : {winner_name} ({winner_comment})."
     )
 
     res = PredictResult(
@@ -126,5 +194,6 @@ def predict_one_match(
         p_draw=p_draw,
         p_away=p_away,
         comment=comment,
+        status="ok",
     )
     return res.to_dict()

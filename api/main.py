@@ -1,62 +1,61 @@
 # api/main.py
 
 from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 
-from scripts.predict_one import predict_one_match
-
-app = FastAPI(title="IA Pronostic Foot")
-
-# CORS pour ton iPhone, ton Mac, etc.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],   # tu pourras restreindre plus tard
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+from scripts.predict_one import (
+    predict_one_match,
+    predict_one_match_from_apisports,
 )
+
+app = FastAPI()
 
 
 @app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "message": "API pronostic foot en ligne",
-    }
+def home():
+    return {"status": "ok", "message": "API ia-pronostic-foot active"}
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
+# =====================================================
+#  /predict_one : par noms d'équipes (+ éventuellement cotes)
+# =====================================================
 @app.get("/predict_one")
 def predict_one(
-    home: str = Query(..., description="Équipe domicile"),
-    away: str = Query(..., description="Équipe extérieure"),
-    odds_home: float | None = Query(
+    home: str = Query(..., description="Équipe domicile (texte libre)"),
+    away: str = Query(..., description="Équipe extérieure (texte libre)"),
+    odds_home: Optional[float] = Query(
         None, description="Cote 1 (domicile), optionnelle"
     ),
-    odds_draw: float | None = Query(
+    odds_draw: Optional[float] = Query(
         None, description="Cote N (nul), optionnelle"
     ),
-    odds_away: float | None = Query(
+    odds_away: Optional[float] = Query(
         None, description="Cote 2 (extérieur), optionnelle"
     ),
 ):
     """
-    Endpoint pour un match unique.
-
-    - Obligatoire : home, away
-    - Optionnel : odds_home, odds_draw, odds_away
-      Si les 3 cotes sont fournies (> 1.0), on calcule les probabilités
-      à partir des cotes (plus réaliste que le mode démo fixe).
+    - Si les 3 cotes sont fournies => prono basé sur les cotes
+    - Sinon => mode démo 33/33/33
     """
-    result = predict_one_match(
+    return predict_one_match(
         home=home,
         away=away,
         odds_home=odds_home,
         odds_draw=odds_draw,
         odds_away=odds_away,
     )
-    return result
+
+
+# =====================================================
+#  /predict_one_api_fixture : Option B (API-FOOTBALL /predictions)
+# =====================================================
+@app.get("/predict_one_api_fixture")
+def predict_one_api_fixture(
+    fixture_id: int = Query(
+        ..., description="ID du fixture API-FOOTBALL (v3.football.api-sports.io)"
+    )
+):
+    """
+    Utilise le endpoint /predictions de API-FOOTBALL pour un fixture précis.
+    """
+    return predict_one_match_from_apisports(fixture_id)
