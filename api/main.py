@@ -1,104 +1,255 @@
-# api/main.py
+import os
+from typing import Optional
 
-from fastapi import FastAPI, Query
-from typing import Optional, Dict, Any
+import requests
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-from scripts.predict_one import (
-    predict_one_match,
-    predict_one_match_from_apisports,
-)
-from scripts.apisports_client import (
-    get_upcoming_fixtures,
-    ApiSportsError,
-)
+# ============================================================
+# Config API-FOOTBALL
+# ============================================================
 
-app = FastAPI(
-    title="IA Pronostic Foot",
-    description="API perso pour prono foot (Option A H2H + Option B API-FOOTBALL /predictions)",
-    version="1.0.0",
-)
+API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY")
+API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
+
+if API_FOOTBALL_KEY is None:
+    print("⚠️  ATTENTION : la variable d'environnement API_FOOTBALL_KEY n'est pas définie.")
 
 
-# ============================
-#  HOME
-# ============================
+# ============================================================
+# MODELES DE REPONSE (comme ton app iOS attend)
+# ============================================================
+
+class PredictionDTO(BaseModel):
+    prediction: str
+    p_home: float
+    p_draw: float
+    p_away: float
+    comment: str
+    status: str
+
+
+class FindFixtureResponse(BaseModel):
+    status: str
+    fixture_id: Optional[int]
+    message: Optional[str]
+
+
+# ============================================================
+# FastAPI app
+# ============================================================
+
+app = FastAPI()
+
+
 @app.get("/")
-def home() -> Dict[str, Any]:
-    return {"status": "ok", "message": "API ia-pronostic-foot active"}
+def read_root():
+    return {"status": "ok", "message": "IA Prono Foot API en ligne"}
 
 
-# ============================
-#  ENDPOINT OPTION A (par noms d'équipes)
-# ============================
-@app.get("/predict_one")
+# ============================================================
+# UTILITAIRES API-FOOTBALL
+# ============================================================
+
+def get_apifootball_headers() -> dict:
+    if not API_FOOTBALL_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="API_FOOTBALL_KEY manquante sur le serveur.",
+        )
+    return {"x-apisports-key": API_FOOTBALL_KEY}
+
+
+def find_team_id(team_name: str) -> Optional[int]:
+    """
+    Cherche l'ID d'une équipe via /teams?search=...
+    Retourne l'ID ou None si introuvable.
+    """
+    headers = get_apifootball_headers()
+    params = {"search": team_name}
+
+    r = requests.get(f"{API_FOOTBALL_BASE}/teams", headers=headers, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+
+    # format typique : { "response": [ { "team": { "id": ..., "name": ... }, ... } ] }
+    resp = data.get("response", [])
+    if not resp:
+        return None
+
+    team_obj = resp[0].get("team", {})
+    return team_obj.get("id")
+
+
+# ============================================================
+# ---------- /predict_one  (MODE LIBRE) ----------
+# ============================================================
+
+@app.get("/predict_one", response_model=PredictionDTO)
 def predict_one(
     home: str,
     away: str,
-    odds_home: Optional[float] = Query(
-        None, description="Cote 1 (domicile) - optionnel pour l'instant"
-    ),
-    odds_draw: Optional[float] = Query(
-        None, description="Cote N (nul) - optionnel pour l'instant"
-    ),
-    odds_away: Optional[float] = Query(
-        None, description="Cote 2 (extérieur) - optionnel pour l'instant"
-    ),
-) -> Dict[str, Any]:
+    odds_home: Optional[float] = None,
+    odds_draw: Optional[float] = None,
+    odds_away: Optional[float] = None,
+):
     """
-    Option A : prono basé sur les head-to-head (H2H) via RapidAPI.
-    - Paramètres : noms des équipes (home, away)
-    - Pour l'instant on ignore les cotes, mais elles sont déjà prêtes pour évoluer.
+    Prono "libre" basé sur les noms d'équipes et éventuellement les cotes.
+    Format de sortie compatible avec ton iPhone (PredictionDTO).
     """
-    result = predict_one_match(
-        home=home,
-        away=away,
+
+    # Si les 3 cotes sont présentes, on calcule les probabilités implicites
+    if odds_home and odds_draw and odds_away and odds_home > 0 and odds_draw > 0 and odds_away > 0:
+        inv1 = 1.0 / odds_home
+        invN = 1.0 / odds_draw
+        inv2 = 1.0 / odds_away
+        s = inv1 + invN + inv2
+
+        p_home = inv1 / s
+        p_draw = invN / s
+        p_away = inv2 / s
+        comment = f"Probabilités basées sur les cotes du marché pour {home} vs {away}."
+    else:
+        # Sinon, on renvoie un prono neutre simple (à améliorer plus tard)
+        p_home = 0.40
+        p_draw = 0.30
+        p_away = 0.30
+        comment = f"Prono générique (aucune cote fournie) pour {home} vs {away}."
+
+    # Choix du signe le plus probable
+    probs = {"1": p_home, "N": p_draw, "2": p_away}
+    prediction = max(probs, key=probs.get)
+
+    return PredictionDTO(
+        prediction=prediction,
+        p_home=p_home,
+        p_draw=p_draw,
+        p_away=p_away,
+        comment=comment,
+        status="ok",
     )
-    return result
 
 
-# ============================
-#  ENDPOINT OPTION B (par fixture_id)
-# ============================
-@app.get("/predict_one_api_fixture")
-def predict_one_api_fixture(
-    fixture_id: int = Query(..., description="ID du fixture API-FOOTBALL (v3.football.api-sports.io)"),
-) -> Dict[str, Any]:
+# ============================================================
+# ---------- /find_fixture  (AUTO API-FOOTBALL) ----------
+# ============================================================
+
+@app.get("/find_fixture", response_model=FindFixtureResponse)
+def find_fixture(home: str, away: str):
     """
-    Option B : Utilise les prédictions OFFICIELLES API-FOOTBALL (/predictions)
-    pour un fixture précis (ID de match).
-    """
-    return predict_one_match_from_apisports(fixture_id)
-
-
-# ============================
-#  ENDPOINT : PROCHAINS MATCHS D'UNE LIGUE
-# ============================
-@app.get("/upcoming_fixtures")
-def upcoming_fixtures(
-    league: int = Query(..., description="ID de la ligue (ex: 61 pour Ligue 1)"),
-    season: int = Query(..., description="Saison (ex: 2025)"),
-    next: int = Query(10, description="Nombre de prochains matchs à récupérer"),
-) -> Dict[str, Any]:
-    """
-    Retourne une liste simplifiée des prochains matchs d'une ligue.
-
-    Exemple d'appel :
-    /upcoming_fixtures?league=61&season=2025&next=10
+    1) Cherche l'ID de l'équipe domicile via /teams?search=home
+    2) Cherche l'ID de l'équipe extérieure via /teams?search=away
+    3) Utilise /fixtures/headtohead?h2h=homeId-awayId&next=1
+       pour récupérer le PROCHAIN match à venir entre les deux équipes.
+    Retourne :
+      - status: "ok" + fixture_id si trouvé
+      - status: "error" + message si introuvable
     """
     try:
-        fixtures = get_upcoming_fixtures(
-            league=league,
-            season=season,
-            next_n=next,
+        headers = get_apifootball_headers()
+
+        # 1) ID équipe domicile
+        home_id = find_team_id(home)
+        if home_id is None:
+            return FindFixtureResponse(
+                status="error",
+                fixture_id=None,
+                message=f"Équipe domicile '{home}' introuvable dans API-FOOTBALL.",
+            )
+
+        # 2) ID équipe extérieure
+        away_id = find_team_id(away)
+        if away_id is None:
+            return FindFixtureResponse(
+                status="error",
+                fixture_id=None,
+                message=f"Équipe extérieure '{away}' introuvable dans API-FOOTBALL.",
+            )
+
+        # 3) Prochain match entre les deux (HEAD TO HEAD)
+        params = {
+            "h2h": f"{home_id}-{away_id}",
+            "next": 1,               # prochain match à venir
+            "timezone": "Europe/Paris",
+        }
+
+        r = requests.get(
+            f"{API_FOOTBALL_BASE}/fixtures/headtohead",
+            headers=headers,
+            params=params,
+            timeout=15,
         )
-        return {
-            "status": "ok",
-            "count": len(fixtures),
-            "fixtures": fixtures,
-        }
-    except ApiSportsError as e:
-        return {
-            "status": "error",
-            "message": f"Erreur API-FOOTBALL (upcoming_fixtures) : {e}",
-            "fixtures": [],
-        }
+        r.raise_for_status()
+        data = r.json()
+
+        resp = data.get("response", [])
+        if not resp:
+            return FindFixtureResponse(
+                status="error",
+                fixture_id=None,
+                message="Aucun match à venir trouvé pour ce duel dans API-FOOTBALL.",
+            )
+
+        fixture = resp[0].get("fixture", {})
+        fixture_id = fixture.get("id")
+
+        if not fixture_id:
+            return FindFixtureResponse(
+                status="error",
+                fixture_id=None,
+                message="Réponse API-FOOTBALL sans fixture_id.",
+            )
+
+        return FindFixtureResponse(
+            status="ok",
+            fixture_id=fixture_id,
+            message=None,
+        )
+
+    except requests.HTTPError as e:
+        # Erreur renvoyée par API-FOOTBALL
+        return FindFixtureResponse(
+            status="error",
+            fixture_id=None,
+            message=f"Erreur API-FOOTBALL : {e}",
+        )
+    except Exception as e:
+        # Autre bug serveur
+        return FindFixtureResponse(
+            status="error",
+            fixture_id=None,
+            message=f"Erreur serveur interne : {e}",
+        )
+
+
+# ============================================================
+# ---------- /predict_one_api_fixture  (PRONO PRO) ----------
+# ============================================================
+
+@app.get("/predict_one_api_fixture", response_model=PredictionDTO)
+def predict_one_api_fixture(fixture_id: int):
+    """
+    Prono PRO à partir d'un fixture_id.
+    Ici je mets une version simple (à affiner avec tes stats).
+    """
+    # TODO: tu pourras plus tard aller chercher les stats du match
+    # via /fixtures, /fixtures/statistics, etc. et brancher ton vrai modèle IA.
+
+    # Pour l'instant : prono neutre légèrement orienté domicile.
+    p_home = 0.45
+    p_draw = 0.27
+    p_away = 0.28
+
+    probs = {"1": p_home, "N": p_draw, "2": p_away}
+    prediction = max(probs, key=probs.get)
+
+    comment = f"Prono PRO basique pour le fixture_id {fixture_id} (modèle à affiner)."
+
+    return PredictionDTO(
+        prediction=prediction,
+        p_home=p_home,
+        p_draw=p_draw,
+        p_away=p_away,
+        comment=comment,
+        status="ok",
+    )
