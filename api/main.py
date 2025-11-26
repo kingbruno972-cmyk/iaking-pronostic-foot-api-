@@ -139,11 +139,8 @@ def find_fixture(home: str, away: str):
     """
     1) Cherche l'ID de l'équipe domicile via /teams?search=home
     2) Cherche l'ID de l'équipe extérieure via /teams?search=away
-    3) Utilise /fixtures/headtohead?h2h=homeId-awayId&next=1
-       pour récupérer le PROCHAIN match à venir entre les deux équipes.
-    Retourne :
-      - status: "ok" + fixture_id si trouvé
-      - status: "error" + message si introuvable
+    3) Essaye d'abord /fixtures/headtohead?h2h=homeId-awayId&next=1
+       Si aucun match à venir -> tente /fixtures/headtohead?h2h=...&last=1
     """
     try:
         headers = get_apifootball_headers()
@@ -166,38 +163,40 @@ def find_fixture(home: str, away: str):
                 message=f"Équipe extérieure '{away}' introuvable dans API-FOOTBALL.",
             )
 
-        # 3) Prochain match entre les deux (HEAD TO HEAD)
-        params = {
-            "h2h": f"{home_id}-{away_id}",
-            "next": 1,               # prochain match à venir
-            "timezone": "Europe/Paris",
-        }
+        # fonction interne pour factoriser l'appel H2H
+        def call_h2h(extra_params: dict) -> Optional[int]:
+            params = {
+                "h2h": f"{home_id}-{away_id}",
+                "timezone": "Europe/Paris",
+            }
+            params.update(extra_params)
 
-        r = requests.get(
-            f"{API_FOOTBALL_BASE}/fixtures/headtohead",
-            headers=headers,
-            params=params,
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json()
-
-        resp = data.get("response", [])
-        if not resp:
-            return FindFixtureResponse(
-                status="error",
-                fixture_id=None,
-                message="Aucun match à venir trouvé pour ce duel dans API-FOOTBALL.",
+            r = requests.get(
+                f"{API_FOOTBALL_BASE}/fixtures/headtohead",
+                headers=headers,
+                params=params,
+                timeout=15,
             )
+            r.raise_for_status()
+            data = r.json()
+            resp = data.get("response", [])
+            if not resp:
+                return None
+            fixture = resp[0].get("fixture", {})
+            return fixture.get("id")
 
-        fixture = resp[0].get("fixture", {})
-        fixture_id = fixture.get("id")
+        # 3a) On tente d'abord le prochain match à venir
+        fixture_id = call_h2h({"next": 1})
 
-        if not fixture_id:
+        # 3b) Si rien, on tente le dernier match joué
+        if fixture_id is None:
+            fixture_id = call_h2h({"last": 1})
+
+        if fixture_id is None:
             return FindFixtureResponse(
                 status="error",
                 fixture_id=None,
-                message="Réponse API-FOOTBALL sans fixture_id.",
+                message="Aucun match trouvé (ni à venir, ni récent) pour ce duel dans API-FOOTBALL.",
             )
 
         return FindFixtureResponse(
@@ -232,7 +231,7 @@ def predict_one_api_fixture(fixture_id: int):
     Prono PRO à partir d'un fixture_id.
     Ici je mets une version simple (à affiner avec tes stats).
     """
-    # TODO: tu pourras plus tard aller chercher les stats du match
+    # TODO: plus tard, aller chercher les stats du match
     # via /fixtures, /fixtures/statistics, etc. et brancher ton vrai modèle IA.
 
     # Pour l'instant : prono neutre légèrement orienté domicile.
