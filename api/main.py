@@ -1,5 +1,6 @@
 import os
 from typing import Optional
+from datetime import datetime, timezone
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -72,7 +73,6 @@ def find_team_id(team_name: str) -> Optional[int]:
     r.raise_for_status()
     data = r.json()
 
-    # format typique : { "response": [ { "team": { "id": ..., "name": ... }, ... } ] }
     resp = data.get("response", [])
     if not resp:
         return None
@@ -140,7 +140,9 @@ def find_fixture(home: str, away: str):
     1) Cherche l'ID de l'équipe domicile via /teams?search=home
     2) Cherche l'ID de l'équipe extérieure via /teams?search=away
     3) Essaye d'abord /fixtures/headtohead?h2h=homeId-awayId&next=1
-       Si aucun match à venir -> tente /fixtures/headtohead?h2h=...&last=1
+       Puis last=1, et dans les deux sens (home-away & away-home)
+    4) Si toujours rien, cherche les matchs d'AUJOURD'HUI pour chaque équipe
+       via /fixtures?date=YYYY-MM-DD&team=...
     """
     try:
         headers = get_apifootball_headers()
@@ -163,27 +165,31 @@ def find_fixture(home: str, away: str):
                 message=f"Équipe extérieure '{away}' introuvable dans API-FOOTBALL.",
             )
 
-        # fonction interne pour factoriser l'appel H2H
+        # ----- Helper : appel H2H dans les deux sens
         def call_h2h(extra_params: dict) -> Optional[int]:
-            params = {
-                "h2h": f"{home_id}-{away_id}",
-                "timezone": "Europe/Paris",
-            }
-            params.update(extra_params)
+            for pair in (f"{home_id}-{away_id}", f"{away_id}-{home_id}"):
+                params = {
+                    "h2h": pair,
+                    "timezone": "Europe/Paris",
+                }
+                params.update(extra_params)
 
-            r = requests.get(
-                f"{API_FOOTBALL_BASE}/fixtures/headtohead",
-                headers=headers,
-                params=params,
-                timeout=15,
-            )
-            r.raise_for_status()
-            data = r.json()
-            resp = data.get("response", [])
-            if not resp:
-                return None
-            fixture = resp[0].get("fixture", {})
-            return fixture.get("id")
+                r = requests.get(
+                    f"{API_FOOTBALL_BASE}/fixtures/headtohead",
+                    headers=headers,
+                    params=params,
+                    timeout=15,
+                )
+                r.raise_for_status()
+                data = r.json()
+                resp = data.get("response", [])
+                if not resp:
+                    continue
+                fixture = resp[0].get("fixture", {})
+                fid = fixture.get("id")
+                if fid:
+                    return fid
+            return None
 
         # 3a) On tente d'abord le prochain match à venir
         fixture_id = call_h2h({"next": 1})
@@ -192,11 +198,47 @@ def find_fixture(home: str, away: str):
         if fixture_id is None:
             fixture_id = call_h2h({"last": 1})
 
+        # ----- 4) Fallback date du jour si toujours rien
+        if fixture_id is None:
+            today_str = datetime.now(timezone.utc).date().isoformat()
+
+            def search_fixtures_for_team(team_id: int) -> Optional[int]:
+                params = {
+                    "team": team_id,
+                    "date": today_str,
+                    "timezone": "Europe/Paris",
+                }
+                r = requests.get(
+                    f"{API_FOOTBALL_BASE}/fixtures",
+                    headers=headers,
+                    params=params,
+                    timeout=15,
+                )
+                r.raise_for_status()
+                data = r.json()
+                for item in data.get("response", []):
+                    teams = item.get("teams", {})
+                    home_t = teams.get("home", {}).get("id")
+                    away_t = teams.get("away", {}).get("id")
+                    if (
+                        (home_t == home_id and away_t == away_id)
+                        or (home_t == away_id and away_t == home_id)
+                    ):
+                        fx = item.get("fixture", {})
+                        fid = fx.get("id")
+                        if fid:
+                            return fid
+                return None
+
+            fixture_id = search_fixtures_for_team(home_id)
+            if fixture_id is None:
+                fixture_id = search_fixtures_for_team(away_id)
+
         if fixture_id is None:
             return FindFixtureResponse(
                 status="error",
                 fixture_id=None,
-                message="Aucun match trouvé (ni à venir, ni récent) pour ce duel dans API-FOOTBALL.",
+                message="Aucun match trouvé (ni à venir, ni récent, ni aujourd'hui) pour ce duel dans API-FOOTBALL.",
             )
 
         return FindFixtureResponse(
@@ -206,14 +248,12 @@ def find_fixture(home: str, away: str):
         )
 
     except requests.HTTPError as e:
-        # Erreur renvoyée par API-FOOTBALL
         return FindFixtureResponse(
             status="error",
             fixture_id=None,
             message=f"Erreur API-FOOTBALL : {e}",
         )
     except Exception as e:
-        # Autre bug serveur
         return FindFixtureResponse(
             status="error",
             fixture_id=None,
