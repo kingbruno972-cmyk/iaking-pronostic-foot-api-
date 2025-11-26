@@ -1,4 +1,5 @@
 # scripts/apisports_client.py
+
 from __future__ import annotations
 
 import os
@@ -6,7 +7,7 @@ from typing import Dict, Any, Optional, List
 import requests
 
 # ================================
-# CONFIG API-FOOTBALL (API-SPORTS)
+# CONFIG API-FOOTBALL
 # ================================
 APISPORTS_KEY = os.environ.get("APISPORTS_KEY")
 API_BASE_URL = "https://v3.football.api-sports.io"
@@ -19,13 +20,13 @@ session.headers.update({
 
 
 class ApiSportsError(Exception):
-    """Erreur custom API-FOOTBALL / API-SPORTS."""
+    """Erreur custom pour API-FOOTBALL."""
     pass
 
 
 def _check_key() -> None:
     if not APISPORTS_KEY:
-        raise ApiSportsError("APISPORTS_KEY non définie")
+        raise ApiSportsError("Variable d'environnement APISPORTS_KEY non définie.")
 
 
 def _api_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -36,11 +37,14 @@ def _api_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     resp = session.get(url, params=params, timeout=TIMEOUT)
 
     if resp.status_code != 200:
-        raise ApiSportsError(f"Erreur HTTP {resp.status_code} : {resp.text[:200]}")
+        raise ApiSportsError(
+            f"HTTP {resp.status_code} sur {url} : {resp.text[:200]}"
+        )
 
     data = resp.json()
-    if data.get("errors"):
-        raise ApiSportsError(str(data["errors"]))
+    errors = data.get("errors") or {}
+    if errors:
+        raise ApiSportsError(str(errors))
 
     return data
 
@@ -49,7 +53,7 @@ def _api_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
 # UTILITAIRES MATCH
 # ================================
 def _normalize_name(name: str) -> str:
-    """Normalise un nom d'équipe pour faciliter la comparaison."""
+    """Normalise un nom d'équipe pour la comparaison."""
     return "".join(
         c.lower() for c in name if c.isalnum() or c.isspace()
     ).strip()
@@ -60,7 +64,7 @@ def _fixture_match_names(
     home_name: str,
     away_name: str,
 ) -> bool:
-    """Retourne True si les noms d'équipes correspondent au fixture."""
+    """Retourne True si le fixture correspond aux 2 équipes."""
     teams = fixture.get("teams", {})
     home = teams.get("home", {})
     away = teams.get("away", {})
@@ -95,10 +99,7 @@ def find_fixture_any_league(
     away: str,
     season: int = DEFAULT_SEASON,
 ) -> Optional[int]:
-    """
-    Cherche un match home/away dans plusieurs ligues.
-    Retourne l'ID du fixture si trouvé, sinon None.
-    """
+    """Cherche un match (fixture_id) dans plusieurs ligues."""
     for lg in LEAGUES_TO_SCAN:
         data = _api_get("fixtures", {
             "league": lg,
@@ -112,13 +113,28 @@ def find_fixture_any_league(
     return None
 
 
+def get_upcoming_fixtures(
+    league: int,
+    season: int,
+    next_n: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    Retourne les prochains matchs d'une ligue.
+    """
+    data = _api_get("fixtures", {
+        "league": league,
+        "season": season,
+        "next": next_n,
+    })
+    return data.get("response", [])
+
+
 # ================================
 # PRÉDICTIONS OFFICIELLES
 # ================================
 def get_predictions_for_fixture(fixture_id: int) -> Dict[str, Any]:
     """
-    Récupère les prédictions officielles API-FOOTBALL pour un fixture.
-    Retourne un dict simplifié (p_home, p_draw, p_away, advice, winner, goals, ...).
+    Récupère les prédictions officielles API-FOOTBALL pour un fixture donné.
     """
     data = _api_get("predictions", {"fixture": fixture_id})
     resp = data.get("response", [])
@@ -128,7 +144,7 @@ def get_predictions_for_fixture(fixture_id: int) -> Dict[str, Any]:
     pred = resp[0].get("predictions", {})
     percent = pred.get("percent", {})
 
-    def to_float(x) -> float:
+    def to_float(x: Any) -> float:
         try:
             return float(str(x).replace("%", "")) / 100.0
         except Exception:
