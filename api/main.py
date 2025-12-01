@@ -42,7 +42,7 @@ class FindFixtureResponse(BaseModel):
     message: Optional[str]
 
 
-# ----------- NOUVEAUX MODELES POUR LA RECHERCHE D'EQUIPES -----------
+# ----------- MODELES POUR LA RECHERCHE D'EQUIPES -----------
 
 class TeamShort(BaseModel):
     id: int
@@ -103,6 +103,12 @@ def find_team_id(team_name: str) -> Optional[int]:
     return team_obj.get("id")
 
 
+def decimal_to_prob(odd: Optional[float]) -> Optional[float]:
+    if odd is None or odd <= 1.0:
+        return None
+    return 1.0 / odd
+
+
 # ============================================================
 # ---------- /predict_one  (MODE LIBRE) ----------
 # ============================================================
@@ -157,7 +163,7 @@ def predict_one(
         btts_yes=btts_yes,
         over25=over25,
         correct_score=correct_score,
-        top_scorers=None,  # à brancher plus tard si tu veux de vrais buteurs
+        top_scorers=None,
     )
 
 
@@ -188,14 +194,14 @@ def teams_search(name: str):
         teams: List[TeamShort] = []
 
         for item in resp:
-            team = item.get("team", {})
-            league = item.get("league", {}) or item.get("country", {})
+            team = item.get("team", {}) or {}
+            league_info = item.get("league", {}) or item.get("country", {}) or {}
             teams.append(
                 TeamShort(
                     id=team.get("id"),
                     name=team.get("name", ""),
                     country=team.get("country"),
-                    league=league.get("name") if isinstance(league, dict) else None,
+                    league=league_info.get("name"),
                     logo=team.get("logo"),
                 )
             )
@@ -360,22 +366,122 @@ def find_fixture(home: str, away: str):
 def predict_one_api_fixture(fixture_id: int):
     """
     Prono PRO à partir d'un fixture_id.
-    Version simple à affiner plus tard.
+    Essaie d'utiliser les cotes API-FOOTBALL (1N2, BTTS, Over 2.5).
+    Si indisponible, revient à un prono neutre.
     """
-    # Pour l'instant : prono neutre légèrement orienté domicile.
+    # Défault : prono neutre légèrement orienté domicile
     p_home = 0.45
     p_draw = 0.27
     p_away = 0.28
+    btts_yes = 0.60
+    over25 = 0.58
+    comment_parts = []
 
+    headers = get_apifootball_headers()
+
+    try:
+        # 1) On va chercher les cotes de ce fixture
+        params = {"fixture": fixture_id, "timezone": "Europe/Paris"}
+        r = requests.get(
+            f"{API_FOOTBALL_BASE}/odds",
+            headers=headers,
+            params=params,
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        resp = data.get("response", [])
+        if resp:
+            # On prend le premier bookmaker dispo
+            odds_block = resp[0]
+            bookmakers = odds_block.get("bookmakers", [])
+            if bookmakers:
+                bookmaker = bookmakers[0]
+                bets = bookmaker.get("bets", [])
+
+                # --- Match Winner / 1X2 ---
+                best_inv = {}
+                for bet in bets:
+                    name = str(bet.get("name", "")).lower()
+                    if "match winner" in name or "1x2" in name or "win" in name:
+                        for val in bet.get("values", []):
+                            label = str(val.get("value", "")).lower()
+                            try:
+                                odd = float(val.get("odd"))
+                            except (TypeError, ValueError):
+                                continue
+
+                            if "home" in label or label == "1":
+                                best_inv["home"] = decimal_to_prob(odd)
+                            elif "draw" in label or label in ("x", "d", "n"):
+                                best_inv["draw"] = decimal_to_prob(odd)
+                            elif "away" in label or label == "2":
+                                best_inv["away"] = decimal_to_prob(odd)
+
+                if all(k in best_inv and best_inv[k] is not None for k in ("home", "draw", "away")):
+                    inv1 = best_inv["home"]
+                    invN = best_inv["draw"]
+                    inv2 = best_inv["away"]
+                    s = inv1 + invN + inv2
+                    p_home = inv1 / s
+                    p_draw = invN / s
+                    p_away = inv2 / s
+                    comment_parts.append("Probabilités PRO basées sur les cotes 1N2 de API-FOOTBALL.")
+
+                # --- Both Teams To Score ---
+                for bet in bets:
+                    name = str(bet.get("name", "")).lower()
+                    if "both teams to score" in name or "btts" in name:
+                        yes_prob = None
+                        for val in bet.get("values", []):
+                            label = str(val.get("value", "")).lower()
+                            try:
+                                odd = float(val.get("odd"))
+                            except (TypeError, ValueError):
+                                continue
+                            if label == "yes":
+                                yes_prob = decimal_to_prob(odd)
+                        if yes_prob is not None:
+                            btts_yes = yes_prob
+                            comment_parts.append("BTTS basé sur les cotes 'Both Teams To Score'.")
+
+                # --- Over/Under buts (on cherche Over 2.5) ---
+                for bet in bets:
+                    name = str(bet.get("name", "")).lower()
+                    if "over/under" in name or "total goals" in name or "goals over/under" in name:
+                        over_prob = None
+                        for val in bet.get("values", []):
+                            # certains formats : "Over 2.5", d'autres juste "2.5"
+                            label = str(val.get("value", "")).lower()
+                            try:
+                                odd = float(val.get("odd"))
+                            except (TypeError, ValueError):
+                                continue
+
+                            if "over" in label and "2.5" in label:
+                                over_prob = decimal_to_prob(odd)
+                            elif label == "2.5" and over_prob is None:
+                                # fallback : si on a juste "2.5", on suppose que c'est l'over
+                                over_prob = decimal_to_prob(odd)
+
+                        if over_prob is not None:
+                            over25 = over_prob
+                            comment_parts.append("Over 2.5 basé sur les cotes Over/Under.")
+
+        if not comment_parts:
+            comment_parts.append("Prono PRO basique (cotes détaillées indisponibles), modèle à affiner.")
+
+    except requests.HTTPError as e:
+        comment_parts.append(f"Erreur API-FOOTBALL (odds) : {e}. Prono neutre utilisé.")
+    except Exception as e:
+        comment_parts.append(f"Erreur interne lors de la récupération des cotes : {e}. Prono neutre utilisé.")
+
+    # Choix du signe le plus probable
     probs = {"1": p_home, "N": p_draw, "2": p_away}
     prediction = max(probs, key=probs.get)
 
-    # Heuristiques BTTS / Over / score
-    btts_yes = 0.60
-    over25 = 0.58
-    correct_score = "2-1"
-
-    comment = f"Prono PRO basique pour le fixture_id {fixture_id} (modèle à affiner)."
+    comment = " ".join(comment_parts) + f" (fixture_id {fixture_id})."
 
     return PredictionDTO(
         prediction=prediction,
@@ -386,6 +492,6 @@ def predict_one_api_fixture(fixture_id: int):
         status="ok",
         btts_yes=btts_yes,
         over25=over25,
-        correct_score=correct_score,
+        correct_score="2-1",  # TODO: plus tard, vrai modèle score exact
         top_scorers=None,
     )
