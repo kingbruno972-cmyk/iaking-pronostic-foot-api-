@@ -367,7 +367,7 @@ def predict_one_api_fixture(fixture_id: int):
     """
     Prono PRO à partir d'un fixture_id.
     Essaie d'utiliser les cotes API-FOOTBALL (1N2, BTTS, Over 2.5).
-    Si indisponible, revient à un prono neutre.
+    Si indisponible ou incohérent, revient à un prono neutre.
     """
     # Défault : prono neutre légèrement orienté domicile
     p_home = 0.45
@@ -375,7 +375,7 @@ def predict_one_api_fixture(fixture_id: int):
     p_away = 0.28
     btts_yes = 0.60
     over25 = 0.58
-    comment_parts = []
+    comment_parts: list[str] = []
 
     headers = get_apifootball_headers()
 
@@ -393,49 +393,64 @@ def predict_one_api_fixture(fixture_id: int):
 
         resp = data.get("response", [])
         if resp:
-            # On prend le premier bookmaker dispo
             odds_block = resp[0]
             bookmakers = odds_block.get("bookmakers", [])
+
             if bookmakers:
                 bookmaker = bookmakers[0]
                 bets = bookmaker.get("bets", [])
 
-                # --- Match Winner / 1X2 ---
-                best_inv = {}
+                used_1x2 = False
+                used_btts = False
+                used_over = False
+
+                odd_home = odd_draw = odd_away = None
+
                 for bet in bets:
-                    name = str(bet.get("name", "")).lower()
-                    if "match winner" in name or "1x2" in name or "win" in name:
+                    name = str(bet.get("name", "")).strip().lower()
+
+                    # --- Match Winner / 1X2 / Full Time Result ---
+                    if (not used_1x2 and
+                        name in ["match winner",
+                                 "1x2",
+                                 "full time result",
+                                 "match result"]):
+                        inv_home = inv_draw = inv_away = None
+
                         for val in bet.get("values", []):
-                            label = str(val.get("value", "")).lower()
+                            label = str(val.get("value", "")).strip().lower()
                             try:
                                 odd = float(val.get("odd"))
                             except (TypeError, ValueError):
                                 continue
 
-                            if "home" in label or label == "1":
-                                best_inv["home"] = decimal_to_prob(odd)
-                            elif "draw" in label or label in ("x", "d", "n"):
-                                best_inv["draw"] = decimal_to_prob(odd)
-                            elif "away" in label or label == "2":
-                                best_inv["away"] = decimal_to_prob(odd)
+                            if label in ("home", "1"):
+                                inv_home = decimal_to_prob(odd)
+                                odd_home = odd
+                            elif label in ("draw", "x", "n", "d"):
+                                inv_draw = decimal_to_prob(odd)
+                                odd_draw = odd
+                            elif label in ("away", "2"):
+                                inv_away = decimal_to_prob(odd)
+                                odd_away = odd
 
-                if all(k in best_inv and best_inv[k] is not None for k in ("home", "draw", "away")):
-                    inv1 = best_inv["home"]
-                    invN = best_inv["draw"]
-                    inv2 = best_inv["away"]
-                    s = inv1 + invN + inv2
-                    p_home = inv1 / s
-                    p_draw = invN / s
-                    p_away = inv2 / s
-                    comment_parts.append("Probabilités PRO basées sur les cotes 1N2 de API-FOOTBALL.")
+                        if inv_home and inv_draw and inv_away:
+                            s = inv_home + inv_draw + inv_away
+                            p_home = inv_home / s
+                            p_draw = inv_draw / s
+                            p_away = inv_away / s
+                            used_1x2 = True
+                            comment_parts.append(
+                                "Probabilités PRO basées sur les cotes 1N2 de API-FOOTBALL "
+                                f"(1={odd_home}, N={odd_draw}, 2={odd_away})."
+                            )
 
-                # --- Both Teams To Score ---
-                for bet in bets:
-                    name = str(bet.get("name", "")).lower()
-                    if "both teams to score" in name or "btts" in name:
+                    # --- Both Teams To Score ---
+                    if (not used_btts and
+                        ("both teams to score" in name or "btts" in name)):
                         yes_prob = None
                         for val in bet.get("values", []):
-                            label = str(val.get("value", "")).lower()
+                            label = str(val.get("value", "")).strip().lower()
                             try:
                                 odd = float(val.get("odd"))
                             except (TypeError, ValueError):
@@ -444,38 +459,50 @@ def predict_one_api_fixture(fixture_id: int):
                                 yes_prob = decimal_to_prob(odd)
                         if yes_prob is not None:
                             btts_yes = yes_prob
-                            comment_parts.append("BTTS basé sur les cotes 'Both Teams To Score'.")
+                            used_btts = True
+                            comment_parts.append(
+                                "BTTS basé sur les cotes 'Both Teams To Score'."
+                            )
 
-                # --- Over/Under buts (on cherche Over 2.5) ---
-                for bet in bets:
-                    name = str(bet.get("name", "")).lower()
-                    if "over/under" in name or "total goals" in name or "goals over/under" in name:
+                    # --- Over/Under buts (on cherche Over 2.5) ---
+                    if (not used_over and
+                        ("over/under" in name
+                         or "total goals" in name
+                         or "goals over/under" in name)):
                         over_prob = None
                         for val in bet.get("values", []):
-                            # certains formats : "Over 2.5", d'autres juste "2.5"
                             label = str(val.get("value", "")).lower()
                             try:
                                 odd = float(val.get("odd"))
                             except (TypeError, ValueError):
                                 continue
 
+                            # Formats possibles : "Over 2.5", "2.5", ">2.5"
                             if "over" in label and "2.5" in label:
                                 over_prob = decimal_to_prob(odd)
                             elif label == "2.5" and over_prob is None:
-                                # fallback : si on a juste "2.5", on suppose que c'est l'over
                                 over_prob = decimal_to_prob(odd)
 
                         if over_prob is not None:
                             over25 = over_prob
-                            comment_parts.append("Over 2.5 basé sur les cotes Over/Under.")
+                            used_over = True
+                            comment_parts.append(
+                                "Over 2.5 basé sur les cotes Over/Under."
+                            )
 
         if not comment_parts:
-            comment_parts.append("Prono PRO basique (cotes détaillées indisponibles), modèle à affiner.")
+            comment_parts.append(
+                "Prono PRO basique (cotes détaillées indisponibles ou non reconnues), modèle à affiner."
+            )
 
     except requests.HTTPError as e:
-        comment_parts.append(f"Erreur API-FOOTBALL (odds) : {e}. Prono neutre utilisé.")
+        comment_parts.append(
+            f"Erreur API-FOOTBALL (odds) : {e}. Prono neutre utilisé."
+        )
     except Exception as e:
-        comment_parts.append(f"Erreur interne lors de la récupération des cotes : {e}. Prono neutre utilisé.")
+        comment_parts.append(
+            f"Erreur interne lors de la récupération des cotes : {e}. Prono neutre utilisé."
+        )
 
     # Choix du signe le plus probable
     probs = {"1": p_home, "N": p_draw, "2": p_away}
@@ -492,6 +519,6 @@ def predict_one_api_fixture(fixture_id: int):
         status="ok",
         btts_yes=btts_yes,
         over25=over25,
-        correct_score="2-1",  # TODO: plus tard, vrai modèle score exact
+        correct_score="2-1",  # TODO: futur modèle score exact
         top_scorers=None,
     )
