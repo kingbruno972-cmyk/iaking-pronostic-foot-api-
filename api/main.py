@@ -29,6 +29,12 @@ class PredictionDTO(BaseModel):
     comment: str
     status: str
 
+    # Nouveaux champs
+    btts_yes: Optional[float] = None   # probabilité que les 2 marquent
+    over25: Optional[float] = None     # probabilité Over 2.5 buts
+    correct_score: Optional[str] = None
+    top_scorers: Optional[list[str]] = None
+
 
 class FindFixtureResponse(BaseModel):
     status: str
@@ -110,7 +116,7 @@ def predict_one(
         p_away = inv2 / s
         comment = f"Probabilités basées sur les cotes du marché pour {home} vs {away}."
     else:
-        # Sinon, on renvoie un prono neutre simple (à améliorer plus tard)
+        # Sinon, prono neutre simple (à améliorer plus tard)
         p_home = 0.40
         p_draw = 0.30
         p_away = 0.30
@@ -120,6 +126,11 @@ def predict_one(
     probs = {"1": p_home, "N": p_draw, "2": p_away}
     prediction = max(probs, key=probs.get)
 
+    # Petites heuristiques provisoires pour BTTS / Over / Score exact
+    btts_yes = min(0.85, max(0.25, (p_home + p_away) * 0.7))
+    over25 = min(0.85, max(0.25, (p_home + p_away) * 0.6))
+    correct_score = "2-1" if p_home >= p_away else "1-2"
+
     return PredictionDTO(
         prediction=prediction,
         p_home=p_home,
@@ -127,6 +138,10 @@ def predict_one(
         p_away=p_away,
         comment=comment,
         status="ok",
+        btts_yes=btts_yes,
+        over25=over25,
+        correct_score=correct_score,
+        top_scorers=None,  # à brancher plus tard si tu veux de vrais buteurs
     )
 
 
@@ -139,10 +154,7 @@ def find_fixture(home: str, away: str):
     """
     1) Cherche l'ID de l'équipe domicile via /teams?search=home
     2) Cherche l'ID de l'équipe extérieure via /teams?search=away
-    3) Essaye d'abord /fixtures/headtohead?h2h=homeId-awayId&next=1
-       Puis last=1, et dans les deux sens (home-away & away-home)
-    4) Si toujours rien, cherche les matchs d'AUJOURD'HUI pour chaque équipe
-       via /fixtures?date=YYYY-MM-DD&team=...
+    3) Essaye H2H (next, last) puis fixtures de la date du jour
     """
     try:
         headers = get_apifootball_headers()
@@ -165,13 +177,10 @@ def find_fixture(home: str, away: str):
                 message=f"Équipe extérieure '{away}' introuvable dans API-FOOTBALL.",
             )
 
-        # ----- Helper : appel H2H dans les deux sens
+        # Helper H2H deux sens
         def call_h2h(extra_params: dict) -> Optional[int]:
             for pair in (f"{home_id}-{away_id}", f"{away_id}-{home_id}"):
-                params = {
-                    "h2h": pair,
-                    "timezone": "Europe/Paris",
-                }
+                params = {"h2h": pair, "timezone": "Europe/Paris"}
                 params.update(extra_params)
 
                 r = requests.get(
@@ -191,14 +200,14 @@ def find_fixture(home: str, away: str):
                     return fid
             return None
 
-        # 3a) On tente d'abord le prochain match à venir
+        # 3a) prochain match à venir
         fixture_id = call_h2h({"next": 1})
 
-        # 3b) Si rien, on tente le dernier match joué
+        # 3b) dernier match joué
         if fixture_id is None:
             fixture_id = call_h2h({"last": 1})
 
-        # ----- 4) Fallback date du jour si toujours rien
+        # 4) date du jour
         if fixture_id is None:
             today_str = datetime.now(timezone.utc).date().isoformat()
 
@@ -269,11 +278,8 @@ def find_fixture(home: str, away: str):
 def predict_one_api_fixture(fixture_id: int):
     """
     Prono PRO à partir d'un fixture_id.
-    Ici je mets une version simple (à affiner avec tes stats).
+    Version simple à affiner plus tard.
     """
-    # TODO: plus tard, aller chercher les stats du match
-    # via /fixtures, /fixtures/statistics, etc. et brancher ton vrai modèle IA.
-
     # Pour l'instant : prono neutre légèrement orienté domicile.
     p_home = 0.45
     p_draw = 0.27
@@ -281,6 +287,11 @@ def predict_one_api_fixture(fixture_id: int):
 
     probs = {"1": p_home, "N": p_draw, "2": p_away}
     prediction = max(probs, key=probs.get)
+
+    # Heuristiques BTTS / Over / score
+    btts_yes = 0.60
+    over25 = 0.58
+    correct_score = "2-1"
 
     comment = f"Prono PRO basique pour le fixture_id {fixture_id} (modèle à affiner)."
 
@@ -291,4 +302,8 @@ def predict_one_api_fixture(fixture_id: int):
         p_away=p_away,
         comment=comment,
         status="ok",
+        btts_yes=btts_yes,
+        over25=over25,
+        correct_score=correct_score,
+        top_scorers=None,
     )
