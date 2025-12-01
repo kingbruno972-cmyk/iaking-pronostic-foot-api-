@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, timezone
 
 import requests
@@ -33,13 +33,29 @@ class PredictionDTO(BaseModel):
     btts_yes: Optional[float] = None   # probabilité que les 2 marquent
     over25: Optional[float] = None     # probabilité Over 2.5 buts
     correct_score: Optional[str] = None
-    top_scorers: Optional[list[str]] = None
+    top_scorers: Optional[List[str]] = None
 
 
 class FindFixtureResponse(BaseModel):
     status: str
     fixture_id: Optional[int]
     message: Optional[str]
+
+
+# ----------- NOUVEAUX MODELES POUR LA RECHERCHE D'EQUIPES -----------
+
+class TeamShort(BaseModel):
+    id: int
+    name: str
+    country: Optional[str] = None
+    league: Optional[str] = None
+    logo: Optional[str] = None
+
+
+class TeamSearchResponse(BaseModel):
+    status: str
+    teams: List[TeamShort]
+    message: Optional[str] = None
 
 
 # ============================================================
@@ -143,6 +159,72 @@ def predict_one(
         correct_score=correct_score,
         top_scorers=None,  # à brancher plus tard si tu veux de vrais buteurs
     )
+
+
+# ============================================================
+# ---------- /teams_search  (RECHERCHE D'EQUIPES) ----------
+# ============================================================
+
+@app.get("/teams_search", response_model=TeamSearchResponse)
+def teams_search(name: str):
+    """
+    Wrap de /teams?search=... pour l'app iOS.
+    Retourne une liste simplifiée d'équipes possibles.
+    """
+    try:
+        headers = get_apifootball_headers()
+        params = {"search": name}
+
+        r = requests.get(
+            f"{API_FOOTBALL_BASE}/teams",
+            headers=headers,
+            params=params,
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        resp = data.get("response", [])
+        teams: List[TeamShort] = []
+
+        for item in resp:
+            team = item.get("team", {})
+            league = item.get("league", {}) or item.get("country", {})
+            teams.append(
+                TeamShort(
+                    id=team.get("id"),
+                    name=team.get("name", ""),
+                    country=team.get("country"),
+                    league=league.get("name") if isinstance(league, dict) else None,
+                    logo=team.get("logo"),
+                )
+            )
+
+        if not teams:
+            return TeamSearchResponse(
+                status="error",
+                teams=[],
+                message=f"Aucune équipe trouvée pour '{name}' dans API-FOOTBALL.",
+            )
+
+        return TeamSearchResponse(
+            status="ok",
+            teams=teams,
+            message=None,
+        )
+
+    except requests.HTTPError as e:
+        return TeamSearchResponse(
+            status="error",
+            teams=[],
+            message=f"Erreur API-FOOTBALL : {e}",
+        )
+    except Exception as e:
+        return TeamSearchResponse(
+            status="error",
+            teams=[],
+            message=f"Erreur serveur interne : {e}",
+        )
 
 
 # ============================================================
